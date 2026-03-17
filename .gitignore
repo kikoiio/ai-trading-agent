@@ -29,3 +29,9 @@ llm_requests.log
 trading_history.log
 *.log
 diary.jsonl
+
+# Knowledge Base runtime data
+data/kb/
+
+# Knowledge
+Al_Brooks_trading_course/

@@ -66,8 +66,26 @@ def main():
 
     taapi = TAAPIClient()
     hyperliquid = HyperliquidAPI()
-    agent = TradingAgent()
 
+    # Initialize Knowledge Base if enabled
+    retriever = None
+    if CONFIG.get("kb_enabled"):
+        try:
+            from src.kb.vectorstore import KBVectorStore
+            from src.kb.retriever import KBRetriever
+            kb_data_dir = CONFIG.get("kb_data_dir") or "data/kb"
+            store = KBVectorStore(persist_dir=os.path.join(kb_data_dir, "chroma_db"))
+            stats = store.stats()
+            if stats["total_entries"] > 0:
+                retriever = KBRetriever(store)
+                logging.info("Knowledge base loaded: %d entries across %d chapters",
+                             stats["total_entries"], stats["num_chapters"])
+            else:
+                logging.warning("KB_ENABLED=True but knowledge base is empty. Run: python -m cli.ingest_kb --source <path>")
+        except Exception as e:
+            logging.error("Failed to initialize knowledge base: %s", e)
+
+    agent = TradingAgent(retriever=retriever)
 
     start_time = datetime.now(timezone.utc)
     invocation_count = 0
@@ -319,7 +337,7 @@ def main():
                     return True
 
             try:
-                outputs = agent.decide_trade(args.assets, context)
+                outputs = agent.decide_trade(args.assets, context, market_data=market_sections)
                 if not isinstance(outputs, dict):
                     add_event(f"Invalid output format (expected dict): {outputs}")
                     outputs = {}
@@ -338,7 +356,7 @@ def main():
                 ])
                 context_retry = json.dumps(context_retry_payload, default=json_default)
                 try:
-                    outputs = agent.decide_trade(args.assets, context_retry)
+                    outputs = agent.decide_trade(args.assets, context_retry, market_data=market_sections)
                     if not isinstance(outputs, dict):
                         add_event(f"Retry invalid format: {outputs}")
                         outputs = {}
@@ -432,6 +450,7 @@ def main():
                                 "sl_oid": sl_oid,
                                 "exit_plan": output.get("exit_plan", ""),
                                 "rationale": output.get("rationale", ""),
+                                "kb_citations": output.get("kb_citations", []),
                                 "order_result": str(order),
                                 "opened_at": datetime.now(timezone.utc).isoformat(),
                                 "filled": filled
@@ -445,7 +464,8 @@ def main():
                                 "timestamp": datetime.now().isoformat(),
                                 "asset": asset,
                                 "action": "hold",
-                                "rationale": output.get("rationale", "")
+                                "rationale": output.get("rationale", ""),
+                                "kb_citations": output.get("kb_citations", []),
                             }
                             f.write(json.dumps(diary_entry) + "\n")
                 except Exception as e:

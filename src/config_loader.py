@@ -93,4 +93,9 @@ CONFIG = {
     # API server
     "api_host": _get_env("API_HOST", "0.0.0.0"),
     "api_port": _get_env("APP_PORT") or _get_env("API_PORT") or "3000",
+    # Knowledge Base
+    "kb_enabled": _get_bool("KB_ENABLED", False),
+    "kb_data_dir": _get_env("KB_DATA_DIR", "data/kb"),
+    "kb_vision_model": _get_env("KB_VISION_MODEL", "openai/gpt-4o-mini"),
+    "kb_top_k": _get_int("KB_TOP_K", 5),
 }

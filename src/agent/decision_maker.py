@@ -10,8 +10,12 @@ from datetime import datetime
 class TradingAgent:
     """High-level trading agent that delegates reasoning to an LLM service."""
 
-    def __init__(self):
-        """Initialize LLM configuration, metadata headers, and indicator helper."""
+    def __init__(self, retriever=None):
+        """Initialize LLM configuration, metadata headers, and indicator helper.
+
+        Args:
+            retriever: Optional KBRetriever instance for knowledge base integration.
+        """
         self.model = CONFIG["llm_model"]
         self.api_key = CONFIG["openrouter_api_key"]
         base = CONFIG["openrouter_base_url"]
@@ -21,20 +25,34 @@ class TradingAgent:
         self.taapi = TAAPIClient()
         # Fast/cheap sanitizer model to normalize outputs on parse failures
         self.sanitize_model = CONFIG.get("sanitize_model") or "openai/gpt-5"
+        # Knowledge base retriever (None when KB_ENABLED=False)
+        self.retriever = retriever
+        self.kb_enabled = CONFIG.get("kb_enabled", False) and retriever is not None
 
-    def decide_trade(self, assets, context):
+    def decide_trade(self, assets, context, market_data=None):
         """Decide for multiple assets in one call.
 
         Args:
             assets: Iterable of asset tickers to score.
             context: Structured market/account state forwarded to the LLM.
+            market_data: Optional dict of per-asset market data for KB retrieval.
 
         Returns:
             List of trade decision payloads, one per asset.
         """
-        return self._decide(context, assets=assets)
+        kb_entries = []
+        if self.kb_enabled and self.retriever and market_data:
+            try:
+                kb_entries = self.retriever.retrieve_for_context(
+                    market_data,
+                    n_per_query=CONFIG.get("kb_top_k") or 5,
+                )
+            except Exception as e:
+                logging.error("KB retrieval failed: %s", e)
 
-    def _decide(self, context, assets):
+        return self._decide(context, assets=assets, kb_entries=kb_entries)
+
+    def _decide(self, context, assets, kb_entries=None):
         """Dispatch decision request to the LLM and enforce output contract."""
         system_prompt = (
             "You are a rigorous QUANTITATIVE TRADER and interdisciplinary MATHEMATICIAN-ENGINEER optimizing risk-adjusted returns for perpetual futures under real execution, margin, and funding constraints.\n"
@@ -47,22 +65,22 @@ class TradingAgent:
             "Your goal: make decisive, first-principles decisions per asset that minimize churn while capturing edge.\n\n"
             "Aggressively pursue setups where calculated risk is outweighed by expected edge; size positions so downside is controlled while upside remains meaningful.\n\n"
             "Core policy (low-churn, position-aware)\n"
-            "1) Respect prior plans: If an active trade has an exit_plan with explicit invalidation (e.g., “close if 4h close above EMA50”), DO NOT close or flip early unless that invalidation (or a stronger one) has occurred.\n"
+            "1) Respect prior plans: If an active trade has an exit_plan with explicit invalidation (e.g., \"close if 4h close above EMA50\"), DO NOT close or flip early unless that invalidation (or a stronger one) has occurred.\n"
             "2) Hysteresis: Require stronger evidence to CHANGE a decision than to keep it. Only flip direction if BOTH:\n"
             "   a) Higher-timeframe structure supports the new direction (e.g., 4h EMA20 vs EMA50 and/or MACD regime), AND\n"
-            "   b) Intraday structure confirms with a decisive break beyond ~0.5×ATR (recent) and momentum alignment (MACD or RSI slope).\n"
+            "   b) Intraday structure confirms with a decisive break beyond ~0.5\u00d7ATR (recent) and momentum alignment (MACD or RSI slope).\n"
             "   Otherwise, prefer HOLD or adjust TP/SL.\n"
-            "3) Cooldown: After opening, adding, reducing, or flipping, impose a self-cooldown of at least 3 bars of the decision timeframe (e.g., 3×5m = 15m) before another direction change, unless a hard invalidation occurs. Encode this in exit_plan (e.g., “cooldown_bars:3 until 2025-10-19T15:55Z”). You must honor your own cooldowns on future cycles.\n"
-            "4) Funding is a tilt, not a trigger: Do NOT open/close/flip solely due to funding unless expected funding over your intended holding horizon meaningfully exceeds expected edge (e.g., > ~0.25×ATR). Consider that funding accrues discretely and slowly relative to 5m bars.\n"
-            "5) Overbought/oversold ≠ reversal by itself: Treat RSI extremes as risk-of-pullback. You need structure + momentum confirmation to bet against trend. Prefer tightening stops or taking partial profits over instant flips.\n"
+            "3) Cooldown: After opening, adding, reducing, or flipping, impose a self-cooldown of at least 3 bars of the decision timeframe (e.g., 3\u00d75m = 15m) before another direction change, unless a hard invalidation occurs. Encode this in exit_plan (e.g., \"cooldown_bars:3 until 2025-10-19T15:55Z\"). You must honor your own cooldowns on future cycles.\n"
+            "4) Funding is a tilt, not a trigger: Do NOT open/close/flip solely due to funding unless expected funding over your intended holding horizon meaningfully exceeds expected edge (e.g., > ~0.25\u00d7ATR). Consider that funding accrues discretely and slowly relative to 5m bars.\n"
+            "5) Overbought/oversold \u2260 reversal by itself: Treat RSI extremes as risk-of-pullback. You need structure + momentum confirmation to bet against trend. Prefer tightening stops or taking partial profits over instant flips.\n"
             "6) Prefer adjustments over exits: If the thesis weakens but is not invalidated, first consider: tighten stop (e.g., to a recent swing or ATR multiple), trail TP, or reduce size. Flip only on hard invalidation + fresh confluence.\n\n"
             "Decision discipline (per asset)\n"
             "- Choose one: buy / sell / hold.\n"
             "- Proactively harvest profits when price action presents a clear, high-quality opportunity that aligns with your thesis.\n"
             "- You control allocation_usd.\n"
             "- TP/SL sanity:\n"
-            "  • BUY: tp_price > current_price, sl_price < current_price\n"
-            "  • SELL: tp_price < current_price, sl_price > current_price\n"
+            "  \u2022 BUY: tp_price > current_price, sl_price < current_price\n"
+            "  \u2022 SELL: tp_price < current_price, sl_price > current_price\n"
             "  If sensible TP/SL cannot be set, use null and explain the logic.\n"
             "- exit_plan must include at least ONE explicit invalidation trigger and may include cooldown guidance you will follow later.\n\n"
             "Leverage policy (perpetual futures)\n"
@@ -71,18 +89,50 @@ class TradingAgent:
             "- Treat allocation_usd as notional exposure; keep it consistent with safe leverage and available margin.\n\n"
             "Tool usage\n"
             "- Aggressively leverage fetch_taapi_indicator whenever an additional datapoint could sharpen your thesis; keep parameters minimal (indicator, symbol like \"BTC/USDT\", interval \"5m\"/\"4h\", optional period).\n"
-            "- Incorporate tool findings into your reasoning, but NEVER paste raw tool responses into the final JSON—summarize the insight instead.\n"
+            "- Incorporate tool findings into your reasoning, but NEVER paste raw tool responses into the final JSON\u2014summarize the insight instead.\n"
             "- Use tools to upgrade your analysis; lack of confidence is a cue to query them before deciding."
             "Reasoning recipe (first principles)\n"
             "- Structure (trend, EMAs slope/cross, HH/HL vs LH/LL), Momentum (MACD regime, RSI slope), Liquidity/volatility (ATR, volume), Positioning tilt (funding, OI).\n"
             "- Favor alignment across 4h and 5m. Counter-trend scalps require stronger intraday confirmation and tighter risk.\n\n"
-            "Output contract\n"
-            "- Output a STRICT JSON object with exactly two properties in this order:\n"
-            "  • reasoning: long-form string capturing detailed, step-by-step analysis that means you can acknowledge existing information as clarity, or acknowledge that you need more information to make a decision (be verbose).\n"
-            "  • trade_decisions: array ordered to match the provided assets list.\n"
-            "- Each item inside trade_decisions must contain the keys {asset, action, allocation_usd, tp_price, sl_price, exit_plan, rationale}.\n"
-            "- Do not emit Markdown or any extra properties.\n"
         )
+
+        # KB-specific prompt section
+        if self.kb_enabled and kb_entries:
+            available_ids = [e.get("id", "") for e in kb_entries if e.get("id")]
+            kb_context = self.retriever.format_entries_for_prompt(kb_entries)
+
+            system_prompt += (
+                "Knowledge Base (Al Brooks Price Action)\n"
+                "- You are provided with relevant entries from Al Brooks' price action trading course below.\n"
+                "- These entries contain trading principles, pattern recognition rules, and execution guidelines.\n"
+                "- You MUST reference these entries in your reasoning and cite them in each trade decision.\n"
+                "- Each trade_decisions item MUST include a kb_citations array with at least one entry.\n"
+                "- Format: {\"entry_id\": \"AB-CH05-S03\", \"relevance\": \"brief explanation of why this principle applies\"}\n"
+                "- Only cite entries that genuinely inform your decision. Do not fabricate entry IDs.\n"
+                f"- Available KB entry IDs for this cycle: {json.dumps(available_ids)}\n"
+                "- You may also use the search_knowledge_base tool to find additional relevant principles.\n\n"
+                f"{kb_context}\n\n"
+            )
+
+            system_prompt += (
+                "Output contract\n"
+                "- Output a STRICT JSON object with exactly two properties in this order:\n"
+                "  \u2022 reasoning: long-form string capturing detailed, step-by-step analysis that means you can acknowledge existing information as clarity, or acknowledge that you need more information to make a decision (be verbose).\n"
+                "  \u2022 trade_decisions: array ordered to match the provided assets list.\n"
+                "- Each item inside trade_decisions must contain the keys {asset, action, allocation_usd, tp_price, sl_price, exit_plan, rationale, kb_citations}.\n"
+                "- kb_citations is an array of objects with {entry_id, relevance}. At least one citation required per decision.\n"
+                "- Do not emit Markdown or any extra properties.\n"
+            )
+        else:
+            system_prompt += (
+                "Output contract\n"
+                "- Output a STRICT JSON object with exactly two properties in this order:\n"
+                "  \u2022 reasoning: long-form string capturing detailed, step-by-step analysis that means you can acknowledge existing information as clarity, or acknowledge that you need more information to make a decision (be verbose).\n"
+                "  \u2022 trade_decisions: array ordered to match the provided assets list.\n"
+                "- Each item inside trade_decisions must contain the keys {asset, action, allocation_usd, tp_price, sl_price, exit_plan, rationale}.\n"
+                "- Do not emit Markdown or any extra properties.\n"
+            )
+
         user_prompt = context
         messages = [
             {"role": "system", "content": system_prompt},
@@ -112,6 +162,35 @@ class TradingAgent:
                 },
             },
         }]
+
+        # Add KB search tool when knowledge base is enabled
+        if self.kb_enabled and self.retriever:
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": "search_knowledge_base",
+                    "description": (
+                        "Search the Al Brooks trading knowledge base for relevant price action principles, "
+                        "patterns, or trading rules. Use when you need specific guidance on a "
+                        "price action concept, entry/exit pattern, or trading principle from the course."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Natural language search query about trading concepts (e.g., 'pullback in bull trend entry', 'wedge reversal pattern')",
+                            },
+                            "n_results": {
+                                "type": "integer",
+                                "description": "Number of results to return (default 3, max 5)",
+                            },
+                        },
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                },
+            })
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -143,6 +222,32 @@ class TradingAgent:
         def _sanitize_output(raw_content: str, assets_list):
             """Coerce arbitrary LLM output into the required reasoning + decisions schema."""
             try:
+                item_properties = {
+                    "asset": {"type": "string", "enum": assets_list},
+                    "action": {"type": "string", "enum": ["buy", "sell", "hold"]},
+                    "allocation_usd": {"type": "number"},
+                    "tp_price": {"type": ["number", "null"]},
+                    "sl_price": {"type": ["number", "null"]},
+                    "exit_plan": {"type": "string"},
+                    "rationale": {"type": "string"},
+                }
+                required_keys = ["asset", "action", "allocation_usd", "tp_price", "sl_price", "exit_plan", "rationale"]
+
+                if self.kb_enabled:
+                    item_properties["kb_citations"] = {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "entry_id": {"type": "string"},
+                                "relevance": {"type": "string"},
+                            },
+                            "required": ["entry_id", "relevance"],
+                            "additionalProperties": False,
+                        },
+                    }
+                    required_keys.append("kb_citations")
+
                 schema = {
                     "type": "object",
                     "properties": {
@@ -151,16 +256,8 @@ class TradingAgent:
                             "type": "array",
                             "items": {
                                 "type": "object",
-                                "properties": {
-                                    "asset": {"type": "string", "enum": assets_list},
-                                    "action": {"type": "string", "enum": ["buy", "sell", "hold"]},
-                                    "allocation_usd": {"type": "number"},
-                                    "tp_price": {"type": ["number", "null"]},
-                                    "sl_price": {"type": ["number", "null"]},
-                                    "exit_plan": {"type": "string"},
-                                    "rationale": {"type": "string"},
-                                },
-                                "required": ["asset", "action", "allocation_usd", "tp_price", "sl_price", "exit_plan", "rationale"],
+                                "properties": item_properties,
+                                "required": required_keys,
                                 "additionalProperties": False,
                             },
                             "minItems": 1,
@@ -222,6 +319,22 @@ class TradingAgent:
                 "rationale": {"type": "string"},
             }
             required_keys = ["asset", "action", "allocation_usd", "tp_price", "sl_price", "exit_plan", "rationale"]
+
+            if self.kb_enabled:
+                base_properties["kb_citations"] = {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "entry_id": {"type": "string"},
+                            "relevance": {"type": "string"},
+                        },
+                        "required": ["entry_id", "relevance"],
+                        "additionalProperties": False,
+                    },
+                }
+                required_keys.append("kb_citations")
+
             return {
                 "type": "object",
                 "properties": {
@@ -297,7 +410,9 @@ class TradingAgent:
             tool_calls = message.get("tool_calls") or []
             if allow_tools and tool_calls:
                 for tc in tool_calls:
-                    if tc.get("type") == "function" and tc.get("function", {}).get("name") == "fetch_taapi_indicator":
+                    func_name = tc.get("function", {}).get("name", "")
+
+                    if tc.get("type") == "function" and func_name == "fetch_taapi_indicator":
                         args = json.loads(tc["function"].get("arguments") or "{}")
                         try:
                             params = {
@@ -326,6 +441,28 @@ class TradingAgent:
                                 "name": "fetch_taapi_indicator",
                                 "content": f"Error: {str(ex)}",
                             })
+
+                    elif tc.get("type") == "function" and func_name == "search_knowledge_base":
+                        args = json.loads(tc["function"].get("arguments") or "{}")
+                        query = args.get("query", "")
+                        n = min(args.get("n_results", 3), 5)
+                        try:
+                            results = self.retriever.search(query, n_results=n) if self.retriever else []
+                            formatted = json.dumps([{
+                                "entry_id": r.get("id", ""),
+                                "title": r.get("metadata", {}).get("slide_title", ""),
+                                "chapter": r.get("metadata", {}).get("chapter", ""),
+                                "content": r.get("document", "")[:500],
+                            } for r in results])
+                        except Exception as ex:
+                            formatted = json.dumps({"error": str(ex)})
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.get("id"),
+                            "name": "search_knowledge_base",
+                            "content": formatted,
+                        })
+
                 continue
 
             try:
@@ -355,9 +492,11 @@ class TradingAgent:
                             item.setdefault("sl_price", None)
                             item.setdefault("exit_plan", "")
                             item.setdefault("rationale", "")
+                            if self.kb_enabled:
+                                item.setdefault("kb_citations", [])
                             normalized.append(item)
                         elif isinstance(item, list) and len(item) >= 7:
-                            normalized.append({
+                            entry = {
                                 "asset": item[0],
                                 "action": item[1],
                                 "allocation_usd": float(item[2]) if item[2] else 0.0,
@@ -365,7 +504,10 @@ class TradingAgent:
                                 "sl_price": float(item[4]) if item[4] and item[4] != "null" else None,
                                 "exit_plan": item[5] if len(item) > 5 else "",
                                 "rationale": item[6] if len(item) > 6 else ""
-                            })
+                            }
+                            if self.kb_enabled:
+                                entry["kb_citations"] = []
+                            normalized.append(entry)
                     return {"reasoning": reasoning_text, "trade_decisions": normalized}
 
                 logging.error("trade_decisions missing or invalid; attempting sanitize")
